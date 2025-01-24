@@ -126,11 +126,104 @@ class ObstacleAvoidanceNode:
                 self.rate.sleep()
                 continue
 
+            if self.laser_data is None or self.current_image is None:
+                rospy.loginfo_throttle(2, "Esperando a recibir datos de LIDAR o la primera imagen...")
+                self.rate.sleep()
+                continue
+
+            # Obtener distancias del LIDAR en los ángulos de interés
+            ranges = np.array(self.laser_data.ranges)
+            angles = np.linspace(self.laser_data.angle_min, self.laser_data.angle_max, len(ranges))
+            distancia_0 = round(self.get_distance_at_angle(ranges, angles, 0), 3)
+            distancia_15 = round(self.get_distance_at_angle(ranges, angles, 15), 3)
+            distancia_neg_15 = round(self.get_distance_at_angle(ranges, angles, 345), 3)
+            distancia_45 = round(self.get_distance_at_angle(ranges, angles, 45), 3)
+            distancia_neg_45 = round(self.get_distance_at_angle(ranges, angles, 315), 3)
+            distancia_90 = round(self.get_distance_at_angle(ranges, angles, 90), 3)
+            distancia_neg_90 = round(self.get_distance_at_angle(ranges, angles, 270), 3)
+            # Crear contexto para el prompt con las distancias obtenidas
+            system_context = (
+                f"Eres un TurtleBot con dimensiones cuadradas de 12 x 12 cm y una altura aproximada de 22 cm, Además, viajas a una velocidad de 0.22 metros/segundos. Estás en una pista de carreras y se te va a compartir datos sensoriales de profundidad provenientes de un Lidar. Basándote en los datos, debes tomar la siguiente acción para evitar colisiones y avanzar de manera segura:"
+                f"""
+                 Acciones:
+                 1. Avanzar hacia delante: X metros.
+                 2. Girar a la derecha: X grados.
+                 3. Girar a la izquierda: X grados."""
+                f"""
+                Datos del Lidar:
+                - Distancia a 0 grados: {distancia_0} metros
+                - Distancia a 15 grados a la derecha: {distancia_15} metros
+                - Distancia a 45 grados a la derecha: {distancia_45} metros
+                - Distancia a 90 grados a la derecha: {distancia_90} metros
+                - Distancia a 345 grados a la izquierda: {distancia_neg_15} metros
+                - Distancia a 315 grados a la izquierda: {distancia_neg_45} metros
+                - Distancia a 270 grados a la izquierda: {distancia_neg_90} metros
+                """
+                f"""
+                Instrucciones para la acción:
+                Formato del output: Devuelve solo una acción en formato JSON con la siguiente estructura:
+                {
+                    "action" : "<action>",
+                    "angle" : <angle>,
+                    "distance" : <distance>,
+                    "duration": <duration>
+                }
+                Ejemplo:
+                {
+                  "action": "FORWARD",
+                  "angle": 0,
+                  "distance": 1.0,
+                  "duration": 5
+                }
+                {
+                  "action": "TURN LEFT",
+                  "angle": 30,
+                  "distance": 0.0,
+                  "duration": 2
+                }
+                {
+                  "action": "TURN RIGHT",
+                  "angle": 30,
+                  "distance": 0.0,
+                  "duration": 2
+                } 
+                """
+                f"""
+                Recuerda:
+                - Solo debes retonar una acción
+                - Asegúrate de que la acción sea segura y evite colisiones
+                - Si hay suficiente espacio para avanzar hacia adelante, hazlo.
+                """
+                f"""
+                Ejemplo de datos:
+                Datos del lidar de un Turtlebot3:
+                - Distancia a 0 grados: 1.5 metros
+                - Distancia a 15 grados a la derecha: 1.15 metros
+                - Distancia a 45 grados a la derecha: 0.6 metros
+                - Distancia a 90 grados a la derecha: 0.4 metros
+                - Distancia a 345 grados a la izquierda: 0.92 metros
+                - Distancia a 315 grados a la izquierda: 0.45 metros
+                - Distancia a 270 grados a la izquierda: 0.2 metros
+                Razonamiento:
+                Si el robot quiere avanzar 1.3 metro hacia adelante:
+                - La distancia a 0 grados es 1.5 metros, que es suficiente para avanzar 1.3 metro.
+                - Las distancias a 15 grados (1.15 metros), 45 grados (0.6 metros) y 345 grados (0.92 metros) también son razonablemente grandes, lo que indica que hay espacio suficiente para el movimiento.
+                En este caso, el robot puede avanzar 1.3 metro hacia adelante sin chocar la pared que se encuentra a unos 0.2 metros hacia adelante.
+                Output:
+                {
+                  "action": "FORWARD",
+                  "angle": 0,
+                  "distance": 1.0,
+                  "duration": 5
+                }
+                """
+            )
+
             if self.current_image is not None:
                 if self.last_image_processed is not self.current_image:
                     rospy.loginfo("Enviando imagen al API para su análisis...")
                     try:
-                        self.api_response = self.analyze_image_with_api(self.current_image)
+                        self.api_response = self.analyze_image_with_api(self.current_image, system_context)
                     except Exception as e:
                         rospy.logerr("Error inesperado en analyze_image_with_api: %s", e)
                         traceback.print_exc()
@@ -143,31 +236,30 @@ class ObstacleAvoidanceNode:
                 rospy.loginfo_throttle(2, "Esperando a recibir la primera imagen...")
 
             # Si no hay acciones o la lista está vacía, detener
-            if not self.api_response.get("actions"):
+            if not self.api_response.get("action"):
                 twist = Twist()
                 self.cmd_vel_pub.publish(twist)
                 self.rate.sleep()
                 continue
 
             # Tomar la acción (única) de la lista
-            action = self.api_response["actions"][0]
-            movement_type = action.get("movement_type", "stop")
-            distance = action.get("distance", 0.0)
-            angle = action.get("angle", 0.0)
-            duration = action.get("duration", 1)
+            movement_type = self.api_response.get("action", "stop")
+            distance = self.api_response.get("distance", 0.0)
+            angle = self.api_response.get("angle", 0.0)
+            duration = self.api_response.get("duration", 1)
 
-            rospy.logdebug("Acción a ejecutar: %s", action)
+            rospy.logdebug("Acción a ejecutar: %s", movement_type)
 
             twist = Twist()
-            if movement_type == "forward":
-                twist.linear.x = self.forward_speed
+            if movement_type == "FORWARD":
+                twist.linear.x = min(self.forward_speed, distance)
                 twist.angular.z = 0.0
-            elif movement_type == "turn_left":
+            elif movement_type == "RIGHT":
                 twist.linear.x = 0.0
-                twist.angular.z = min(self.max_turn_speed, self.max_turn_speed * (angle/90.0))
-            elif movement_type == "turn_right":
+                twist.angular.z = -min(self.max_turn_speed, self.max_turn_speed * (angle / 90.0))
+            elif movement_type == "LEFT":
                 twist.linear.x = 0.0
-                twist.angular.z = -min(self.max_turn_speed, self.max_turn_speed * (angle/90.0))
+                twist.angular.z = min(self.max_turn_speed, self.max_turn_speed * (angle / 90.0))
             else:
                 # stop
                 twist.linear.x = 0.0
@@ -183,73 +275,21 @@ class ObstacleAvoidanceNode:
 
         self.shutdown()
 
-    def analyze_image_with_api(self, cv_image):
+    def analyze_image_with_api(self, cv_image, prompt_context):
         # Codificar la imagen a base64 según la documentación
         _, buffer = cv2.imencode('.jpg', cv_image)
         img_bytes = buffer.tobytes()
         base64_image = base64.b64encode(img_bytes).decode('utf-8')
 
-        # Mensaje del sistema, exigir una sola acción
-        # Ahora indicamos que tenemos en cuenta las 3 últimas iteraciones
-        system_message = (
-            "Eres un asistente para un TurtleBot3 en una pista de carreras. "
-            "Debes analizar la imagen y generar instrucciones en JSON, sin Markdown. "
-            "El TurtleBot3 debe siempre intentar avanzar, salvo que haya un obstáculo cercano. "
-            "Debes devolver sólo una acción en el campo 'actions' (una sola), por ejemplo:\n"
-            "Formato del JSON:\n"
-            "{\n"
-            "  \"actions\": [\n"
-            "    {\"movement_type\": \"forward\", \"distance\": <num>, \"duration\": <num>},\n"
-            "    {\"movement_type\": \"turn_left\", \"angle\": <num>, \"duration\": <num>},\n"
-            "  ]\n"
-            "}\n"
-            "Nada más que este JSON con una sola acción. RECUERDA DEBES AVANZAR SIEMPRE PORQUE ES UNA CARRERA PARAR ES SOLO CUANDO LA CAMARA NO VE NADA PORQUE ESTA PEGADO A UNA PARED. AVANZA SIEMPRE NO DES VUELTAS A CADA RATO"
-            "Tienes en cuenta las últimas 3 imágenes previas con sus acciones resultantes. "
-            "Si ha avanzado varias veces seguidas, el camino delante está libre. "
-            "Usa la información histórica para tomar la mejor decisión. SI VES TODO OSCURO O TODO CLARO ES PORQUE TE HAZ ACERCADO MUCHO A UNA PARED LO QUE DEBES HACER ES GIRARA 180 GRADOS"
-        )
-
-        # Construir mensajes adicionales con el historial (hasta 3 últimas iteraciones)
-        # Cada elemento de self.history es {"image_base64":..., "response":...}
-        history_messages = []
-        for i, entry in enumerate(self.history[-3:], start=1):
-            # Podríamos proporcionar un pequeño contexto al modelo
-            history_msg = (
-                f"Historial {i}:\n"
-                f"Imagen previa (base64 no mostrada por brevedad).\n"
-                f"Respuesta anterior del API: {json.dumps(entry['response'])}\n"
-            )
-            # Lo agregamos como un mensaje assistant para dar contexto
-            history_messages.append(
-                {"role": "assistant", "content": history_msg}
-            )
-
-        user_message = [
-            {
-                "type": "text",
-                "text": "Analiza la imagen y proporciona el JSON con una sola acción basándote también en el historial. RECUERDA ES UNA PISTA DE CARRERAS DE CAJAS DE CARTON TU PUEDES CREER QUE ESTAS CERCA PERO NO ES PORQUE LA CAMARA REDUCE AVANZA NOMAS ASI CREAS QEU CHIQUES SOO CUANDO NO VEAS ABSOLUTAMENTE NADA AHI RECIEN GIRA SINO AVANZA"
-            },
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{base64_image}"
-                }
-            }
+        # Mensaje del sistema
+        messages = [
+            {"role": "system", "content": prompt_context},
+            {"role": "user", "content": "Imagen proporcionada como base64:", "image_base64": base64_image}
         ]
 
         rospy.loginfo("Esperando respuesta del API de OpenAI...")
 
         try:
-            messages = [
-                {"role": "system", "content": system_message},
-            ]
-
-            # Agregar el historial como contexto previo
-            messages.extend(history_messages)
-
-            # Finalmente, el mensaje del usuario con la imagen actual
-            messages.append({"role": "user", "content": user_message})
-
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
